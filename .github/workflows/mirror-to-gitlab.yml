@@ -20,3 +20,5 @@ jobs:
           git remote set-url --push origin https://oauth2:${GITLAB_TOKEN}@gitlab.com/ecomms1/ecomms-notificationservice.git
 
           git push --mirror
+
+# This is to trigger the github and gitlab mirroring process and action.
