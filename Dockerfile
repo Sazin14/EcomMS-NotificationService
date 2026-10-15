@@ -17,7 +17,8 @@ FROM php:8.4-cli-alpine AS composer-build
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-RUN apk add --no-cache --virtual .build-deps \
+RUN apk add --no-cache git \
+    && apk add --no-cache --virtual .build-deps \
         $PHPIZE_DEPS \
         linux-headers \
     && docker-php-ext-install sockets \
@@ -29,7 +30,7 @@ COPY composer.json composer.lock ./
 RUN composer install \
     --no-dev \
     --no-interaction \
-    --prefer-dist \
+    --prefer-install=dist \
     --optimize-autoloader \
     --no-scripts
 
