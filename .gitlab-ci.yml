@@ -89,3 +89,37 @@ promote_gitops:
         git commit -m "Deploy Notification Service ${CI_COMMIT_SHORT_SHA}"
         git push origin "HEAD:${GITOPS_BRANCH}"
       fi
+
+registry_diagnostics:
+  stage: test
+  tags:
+    - dell-local
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "devops"'
+  script:
+    - |
+      set -eu
+
+      echo "=== Registry configuration (non-secret values only) ==="
+      printf 'Registry: %s\n' "$CI_REGISTRY"
+      printf 'Image path: %s\n' "$CI_REGISTRY_IMAGE"
+      printf 'Registry username: %s\n' "$CI_REGISTRY_USER"
+      printf 'Protected ref: %s\n' "$CI_COMMIT_REF_PROTECTED"
+
+      test -n "${CI_REGISTRY_PASSWORD:-}" || {
+        echo "ERROR: Registry password variable is empty."
+        exit 1
+      }
+
+      echo "=== Testing registry login ==="
+      printf '%s' "$CI_REGISTRY_PASSWORD" |
+        docker login "$CI_REGISTRY" \
+          -u "$CI_REGISTRY_USER" --password-stdin
+
+      trap 'docker logout "$CI_REGISTRY" >/dev/null 2>&1 || true' EXIT
+
+      echo "=== Checking access to the existing image ==="
+      docker manifest inspect \
+        "$CI_REGISTRY_IMAGE:latest" >/dev/null
+
+      echo "Registry login and existing-image inspection succeeded."
