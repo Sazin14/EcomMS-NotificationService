@@ -4,50 +4,66 @@ stages:
 
 workflow:
   rules:
+    # Validate merge requests targeting main.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+
+    # Run pipelines only for devops and main pushes.
     - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "devops" || $CI_COMMIT_BRANCH == "main")'
+
     - when: never
 
 variables:
-  NOTIFICATION_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  NOTIFICATION_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
   GITOPS_BRANCH: "devops"
   GITOPS_DEPLOYMENT: "apps/notification/service/deployment.yaml"
 
+# Build and validate the Docker image.
+# Publish only from a push pipeline on main.
 build_test:
   stage: test
   tags:
     - dell-local
+
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
     - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "devops" || $CI_COMMIT_BRANCH == "main")'
+
   script:
     - docker info
     - docker build --pull --platform linux/amd64 -t "$NOTIFICATION_IMAGE" .
     - docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" artisan --version
     - docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" artisan route:list
     - |
+      set -eu
+
       if [ "$CI_PIPELINE_SOURCE" = "push" ] &&
          [ "$CI_COMMIT_BRANCH" = "main" ]; then
-        echo "$CI_REGISTRY_PASSWORD" |
+        printf '%s' "$CI_REGISTRY_PASSWORD" |
           docker login "$CI_REGISTRY" \
             -u "$CI_REGISTRY_USER" --password-stdin
+
         docker push "$NOTIFICATION_IMAGE"
-        docker logout "$CI_REGISTRY"
       else
         echo "Validation only: image will not be published."
       fi
+
   after_script:
     - docker logout "$CI_REGISTRY" || true
-    - docker image rm "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" || true
+    - docker image rm "$NOTIFICATION_IMAGE" || true
 
+# Promote the successfully published image through GitOps.
+# This job runs only for push pipelines on main.
 promote_gitops:
   stage: promote
   tags:
     - dell-local
+
   needs:
-    - build_test
+    - job: build_test
+
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+
   script:
     - |
       set -eu
@@ -65,17 +81,24 @@ promote_gitops:
         "$WORK_DIR/gitops"
 
       cd "$WORK_DIR/gitops"
+
       git config user.name "GitLab CI"
       git config user.email "gitlab-ci@users.noreply.github.com"
 
+      # Update only the Notification Service image tag.
       sed -i -E \
-        "s|(image: registry\\.gitlab\\.com/ecomms1/ecomms-notificationservice:)[^[:space:]]+|\\1${CI_COMMIT_SHORT_SHA}|g" \
+        "s|(image: registry\\.gitlab\\.com/ecomms1/ecomms-notificationservice:)[^[:space:]]+|\\1${CI_COMMIT_SHA}|g" \
         "$GITOPS_DEPLOYMENT"
 
       echo "=== Updated Notification Service image references ==="
       grep -n 'image:' "$GITOPS_DEPLOYMENT"
 
-      EXPECTED_COUNT="$(grep -c "image: registry.gitlab.com/ecomms1/ecomms-notificationservice:${CI_COMMIT_SHORT_SHA}" "$GITOPS_DEPLOYMENT")"
+      EXPECTED_COUNT="$(
+        grep -cF \
+          "image: registry.gitlab.com/ecomms1/ecomms-notificationservice:${CI_COMMIT_SHA}" \
+          "$GITOPS_DEPLOYMENT" || true
+      )"
+
       if [ "$EXPECTED_COUNT" -ne 1 ]; then
         echo "ERROR: Expected exactly one Notification Service image reference; found $EXPECTED_COUNT."
         exit 1
@@ -86,40 +109,6 @@ promote_gitops:
       if git diff --cached --quiet; then
         echo "GitOps already references this image; no commit needed."
       else
-        git commit -m "Deploy Notification Service ${CI_COMMIT_SHORT_SHA}"
+        git commit -m "Deploy Notification Service ${CI_COMMIT_SHA}"
         git push origin "HEAD:${GITOPS_BRANCH}"
       fi
-
-registry_diagnostics:
-  stage: test
-  tags:
-    - dell-local
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "devops"'
-  script:
-    - |
-      set -eu
-
-      echo "=== Registry configuration (non-secret values only) ==="
-      printf 'Registry: %s\n' "$CI_REGISTRY"
-      printf 'Image path: %s\n' "$CI_REGISTRY_IMAGE"
-      printf 'Registry username: %s\n' "$CI_REGISTRY_USER"
-      printf 'Protected ref: %s\n' "$CI_COMMIT_REF_PROTECTED"
-
-      test -n "${CI_REGISTRY_PASSWORD:-}" || {
-        echo "ERROR: Registry password variable is empty."
-        exit 1
-      }
-
-      echo "=== Testing registry login ==="
-      printf '%s' "$CI_REGISTRY_PASSWORD" |
-        docker login "$CI_REGISTRY" \
-          -u "$CI_REGISTRY_USER" --password-stdin
-
-      trap 'docker logout "$CI_REGISTRY" >/dev/null 2>&1 || true' EXIT
-
-      echo "=== Checking access to the existing image ==="
-      docker manifest inspect \
-        "$CI_REGISTRY_IMAGE:latest" >/dev/null
-
-      echo "Registry login and existing-image inspection succeeded."
