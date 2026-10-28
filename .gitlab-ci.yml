@@ -1,26 +1,91 @@
 stages:
-  - build
+  - test
+  - promote
 
 workflow:
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "devops")'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "devops" || $CI_COMMIT_BRANCH == "main")'
     - when: never
 
 variables:
-  IMAGE_TAG: "$CI_COMMIT_SHA"
+  NOTIFICATION_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  GITOPS_BRANCH: "devops"
+  GITOPS_DEPLOYMENT: "apps/notification/service/deployment.yaml"
 
-build-and-push:
-  stage: build
+build_test:
+  stage: test
   tags:
     - dell-local
-  script:
-    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    - docker build --platform linux/amd64 -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG" -t "$CI_REGISTRY_IMAGE:latest" .
-    - docker push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
-    - |
-      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
-        docker push "$CI_REGISTRY_IMAGE:latest"
-      fi
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH == "devops"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "devops" || $CI_COMMIT_BRANCH == "main")'
+  script:
+    - docker info
+    - docker build --pull --platform linux/amd64 -t "$NOTIFICATION_IMAGE" .
+    - docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" artisan --version
+    - docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" artisan route:list
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "push" ] &&
+         [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        echo "$CI_REGISTRY_PASSWORD" |
+          docker login "$CI_REGISTRY" \
+            -u "$CI_REGISTRY_USER" --password-stdin
+        docker push "$NOTIFICATION_IMAGE"
+        docker logout "$CI_REGISTRY"
+      else
+        echo "Validation only: image will not be published."
+      fi
+  after_script:
+    - docker logout "$CI_REGISTRY" || true
+    - docker image rm "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" || true
+
+promote_gitops:
+  stage: promote
+  tags:
+    - dell-local
+  needs:
+    - build_test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+  script:
+    - |
+      set -eu
+
+      if [ -z "${GITOPS_GITHUB_TOKEN:-}" ]; then
+        echo "ERROR: GITOPS_GITHUB_TOKEN is not configured."
+        exit 1
+      fi
+
+      WORK_DIR="$(mktemp -d)"
+      trap 'rm -rf "$WORK_DIR"' EXIT
+
+      git clone --depth 1 --branch "$GITOPS_BRANCH" \
+        "https://x-access-token:${GITOPS_GITHUB_TOKEN}@github.com/Rasiulknots/ecomms-gitops.git" \
+        "$WORK_DIR/gitops"
+
+      cd "$WORK_DIR/gitops"
+      git config user.name "GitLab CI"
+      git config user.email "gitlab-ci@users.noreply.github.com"
+
+      sed -i -E \
+        "s|(image: registry\\.gitlab\\.com/ecomms1/ecomms-notificationservice:)[^[:space:]]+|\\1${CI_COMMIT_SHORT_SHA}|g" \
+        "$GITOPS_DEPLOYMENT"
+
+      echo "=== Updated Notification Service image references ==="
+      grep -n 'image:' "$GITOPS_DEPLOYMENT"
+
+      EXPECTED_COUNT="$(grep -c "image: registry.gitlab.com/ecomms1/ecomms-notificationservice:${CI_COMMIT_SHORT_SHA}" "$GITOPS_DEPLOYMENT")"
+      if [ "$EXPECTED_COUNT" -ne 1 ]; then
+        echo "ERROR: Expected exactly one Notification Service image reference; found $EXPECTED_COUNT."
+        exit 1
+      fi
+
+      git add "$GITOPS_DEPLOYMENT"
+
+      if git diff --cached --quiet; then
+        echo "GitOps already references this image; no commit needed."
+      else
+        git commit -m "Deploy Notification Service ${CI_COMMIT_SHORT_SHA}"
+        git push origin "HEAD:${GITOPS_BRANCH}"
+      fi
