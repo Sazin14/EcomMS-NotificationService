@@ -35,6 +35,13 @@ RUN composer install \
     --no-scripts
 
 COPY . .
+
+# The middleware classes are namespaced App\Http\Middleware but live in app/Http/Middlewares, which PSR-4 cannot
+# autoload. Provide the expected directory at build time (source files stay untouched).
+RUN if [ -d app/Http/Middlewares ] && [ ! -e app/Http/Middleware ]; then \
+        cp -a app/Http/Middlewares app/Http/Middleware; \
+    fi
+
 RUN composer dump-autoload \
     --no-dev \
     --optimize \
@@ -67,6 +74,8 @@ RUN apk add --no-cache \
         intl \
         opcache \
         zip \
+    && pecl install redis-6.1.0 \
+    && docker-php-ext-enable redis \
     && apk del .build-deps
 
 WORKDIR /var/www/html

@@ -16,6 +16,7 @@ variables:
   NOTIFICATION_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
   GITOPS_BRANCH: "devops"
   GITOPS_DEPLOYMENT: "apps/notification/service/deployment.yaml"
+  GITOPS_CONSUMERS: "apps/notification/service/order-consumer.yaml apps/notification/service/inventory-consumer.yaml"
 
 # Build and validate the Docker image.
 # Publish only from a push pipeline on main.
@@ -33,6 +34,11 @@ build_test:
     - docker build --pull --platform linux/amd64 -t "$NOTIFICATION_IMAGE" .
     - docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" artisan --version
     - docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" artisan route:list
+    # Regression checks: staff routes need the Redis extension and the middleware classes must autoload.
+    - |
+      docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" -r 'exit(extension_loaded("redis") ? 0 : 1);'
+    - |
+      docker run --rm --entrypoint php "$NOTIFICATION_IMAGE" -r 'require "vendor/autoload.php"; foreach (["VerifyJwt", "CheckAuthorization", "CheckPermission", "EnsureCustomer"] as $c) { if (! class_exists("App\\Http\\Middleware\\".$c)) { fwrite(STDERR, "missing middleware $c\n"); exit(1); } }'
     - |
       set -eu
 
@@ -85,26 +91,26 @@ promote_gitops:
       git config user.name "GitLab CI"
       git config user.email "gitlab-ci@users.noreply.github.com"
 
-      # Update only the Notification Service image tag.
-      sed -i -E \
-        "s|(image: registry\\.gitlab\\.com/ecomms1/ecomms-notificationservice:)[^[:space:]]+|\\1${CI_COMMIT_SHA}|g" \
-        "$GITOPS_DEPLOYMENT"
-
-      echo "=== Updated Notification Service image references ==="
-      grep -n 'image:' "$GITOPS_DEPLOYMENT"
+      # Update every Notification Service image reference: API (init container + api) and both consumers.
+      GITOPS_FILES="$GITOPS_DEPLOYMENT $GITOPS_CONSUMERS"
+      for f in $GITOPS_FILES; do
+        sed -i -E \
+          "s|(image: registry\\.gitlab\\.com/ecomms1/ecomms-notificationservice:)[^[:space:]]+|\\1${CI_COMMIT_SHA}|g" \
+          "$f"
+        grep -n 'image:' "$f"
+      done
 
       EXPECTED_COUNT="$(
-        grep -cF \
-          "image: registry.gitlab.com/ecomms1/ecomms-notificationservice:${CI_COMMIT_SHA}" \
-          "$GITOPS_DEPLOYMENT" || true
+        cat $GITOPS_FILES | grep -cF \
+          "image: registry.gitlab.com/ecomms1/ecomms-notificationservice:${CI_COMMIT_SHA}" || true
       )"
 
-      if [ "$EXPECTED_COUNT" -ne 1 ]; then
-        echo "ERROR: Expected exactly one Notification Service image reference; found $EXPECTED_COUNT."
+      if [ "$EXPECTED_COUNT" -ne 4 ]; then
+        echo "ERROR: Expected exactly four Notification Service image references; found $EXPECTED_COUNT."
         exit 1
       fi
 
-      git add "$GITOPS_DEPLOYMENT"
+      git add $GITOPS_FILES
 
       if git diff --cached --quiet; then
         echo "GitOps already references this image; no commit needed."
